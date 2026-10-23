@@ -91,7 +91,7 @@ _CATEGORY_HINTS = [
 
 
 def parse_jd_text(text: str, title_hint: Optional[str] = None) -> dict:
-    text = (text or "").strip()[:30000]
+    text = (text or "").strip()[:100000]
     draft: dict[str, Any] = {}
     if llm_available():
         try:
@@ -228,11 +228,78 @@ def _csv_safe(value: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Candidates directory: expose new-pipeline results in the shape the Candidates page already reads
+# ---------------------------------------------------------------------------
+def candidate_directory_items(db: Session) -> list[dict]:
+    rows = (
+        db.query(CandidateResult, JobDescription.title)
+        .join(ScreeningSession, ScreeningSession.id == CandidateResult.session_id)
+        .join(JobDescription, JobDescription.id == ScreeningSession.job_description_id)
+        .filter(CandidateResult.status == "scored")
+        .all()
+    )
+    return [
+        {
+            "id": c.id,
+            "resume_id": c.resume_id,
+            "original_filename": c.original_filename,
+            "session_id": c.session_id,
+            "job_description_title": title,
+            "evaluated_at": c.updated_at,
+            "overall_score": c.match_percent,
+            "max_overall_score": 100.0,
+            "evaluation_summary": c.assessment or "",
+        }
+        for c, title in rows
+    ]
+
+
+def candidate_result_as_evaluation(db: Session, result_id: str) -> Optional[dict]:
+    c = db.query(CandidateResult).filter(CandidateResult.id == result_id, CandidateResult.status == "scored").first()
+    session = db.get(ScreeningSession, c.session_id) if c else None
+    if c is None or session is None:
+        return None
+    score = {"met": 5.0, "partial": 2.5, "missing": 0.0}
+    rubric = []
+    for r in c.requirement_results or []:
+        ev = r.get("evidence") or ""
+        status = r.get("status", "missing")
+        rubric.append(
+            {
+                "criterion": r.get("name", ""),
+                "criterion_type": "experience" if r.get("type") == "experience" else "skill",
+                "score": score.get(status, 0.0),
+                "max_score": 5.0,
+                "evidence_status": "not_found_in_resume" if status == "missing" else ("documented" if (ev or r.get("type") == "experience") else "unknown"),
+                "explanation": r.get("note") or ("Supported by resume text." if ev else "No mention found in the resume."),
+                "evidence_quotes": [ev] if ev else [],
+            }
+        )
+    return {
+        "id": c.id,
+        "session_id": c.session_id,
+        "resume_id": c.resume_id,
+        "original_filename": c.original_filename,
+        "job_description_id": session.job_description_id,
+        "job_title": session.job_description.title if session.job_description else "",
+        "overall_score": c.match_percent,
+        "max_overall_score": 100.0,
+        "rubric": rubric,
+        "missing_criteria": list(c.missing or []),
+        "unverified_criteria": list(c.partial or []),
+        "evaluation_summary": c.assessment or "",
+        "model_name": None,
+        "evaluated_at": c.updated_at,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Router factory
 # ---------------------------------------------------------------------------
 def build_router(
     require_admin_or_recruiter: Callable[..., User],
     require_any_authenticated_user: Callable[..., User],
+    require_admin_only: Callable[..., User],
 ) -> APIRouter:
     router = APIRouter()
 
@@ -521,6 +588,54 @@ def build_router(
         if len((text or "").strip()) < 20:
             raise HTTPException(status_code=422, detail="The file contains too little text to be a job description.")
         return parse_jd_text(text)
+
+    # ------------------------------------------------------------------ JD permanent delete
+    @router.delete("/api/job-descriptions/{jd_id}")
+    def delete_job_description(
+        jd_id: str,
+        delete_sessions: bool = False,
+        current_user: User = Depends(require_admin_only),
+        db: Session = Depends(get_db),
+    ):
+        """Permanently delete a JD. If screening sessions use it, the caller must pass delete_sessions=true,
+        which also deletes those sessions with their resumes, evaluations and candidate results."""
+        jd = db.query(JobDescription).filter(JobDescription.id == jd_id).first()
+        if jd is None:
+            raise HTTPException(status_code=404, detail=f"Job description '{jd_id}' not found.")
+        sessions = db.query(ScreeningSession).filter(ScreeningSession.job_description_id == jd_id).all()
+        if sessions and not delete_sessions:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": f"'{jd.title}' is used by {len(sessions)} screening session(s).",
+                    "session_count": len(sessions),
+                },
+            )
+        sids = [s.id for s in sessions]
+        if any(screening.is_running(sid) for sid in sids):
+            raise HTTPException(status_code=409, detail="A screening is still running for this job description.")
+        stored = (
+            [n for (n,) in db.query(StagedResume.storage_name).filter(StagedResume.screening_session_id.in_(sids)).all()]
+            if sids
+            else []
+        )
+        if sids:
+            db.query(CandidateResult).filter(CandidateResult.session_id.in_(sids)).delete(synchronize_session=False)
+            db.query(SessionRun).filter(SessionRun.session_id.in_(sids)).delete(synchronize_session=False)
+        db.delete(jd)  # ORM cascade removes its sessions, staged resumes and rubric evaluations
+        db.commit()
+        # Files only after the DB commit succeeded, so a failed delete never loses files.
+        for name in stored:
+            try:
+                p = RESUME_STORAGE_DIR / name
+                if p.is_file():
+                    p.unlink()
+            except OSError:
+                pass
+        for sid in sids:
+            close_session_chroma(sid)
+            remove_session_storage_dir(RESUME_STORAGE_DIR / sid)
+        return {"id": jd_id, "deleted_sessions": len(sids)}
 
     # ------------------------------------------------------------------ dashboard
     @router.get("/api/dashboard/overview")

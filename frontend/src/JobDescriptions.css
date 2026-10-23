@@ -249,6 +249,28 @@
   line-height: 1.5;
   margin: 0 0 14px;
   flex: 1;
+  /* Long extracted text stays in a compact box: ~5 lines visible, the rest scrolls. */
+  max-height: 7.5em;
+  overflow-y: auto;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+  padding-right: 6px;
+}
+
+.jd-upload-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 2px 0 8px;
+}
+
+.jd-upload-row .btn {
+  cursor: pointer;
+}
+
+.jd-upload-hint {
+  font-size: 12px;
+  color: #64748b;
 }
 
 .jd-tags-list {

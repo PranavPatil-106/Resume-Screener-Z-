@@ -227,13 +227,13 @@ require_any_authenticated_user = require_roles(
 )
 
 # --- Screening workflow (background pipeline, results, candidate detail, chat, JD parsing, dashboard) ---
-from screening_api import build_router  # noqa: E402
+from screening_api import build_router, candidate_directory_items, candidate_result_as_evaluation  # noqa: E402
 
 # shortcut: the two new tables are created at startup instead of via an Alembic migration; add a migration before production.
 SessionRun.__table__.create(bind=engine, checkfirst=True)
 CandidateResult.__table__.create(bind=engine, checkfirst=True)
 
-app.include_router(build_router(require_admin_or_recruiter, require_any_authenticated_user))
+app.include_router(build_router(require_admin_or_recruiter, require_any_authenticated_user, require_admin_only))
 
 
 @app.post("/api/auth/login", response_model=UserResponse)
@@ -2779,7 +2779,13 @@ def list_candidates_directory(
         .order_by(ResumeEvaluation.evaluated_at.desc())
         .all()
     )
-    return evaluations
+    # Include results from the new screening pipeline alongside legacy rubric evaluations.
+    merged = list(evaluations) + candidate_directory_items(db)
+    return sorted(
+        merged,
+        key=lambda e: (e["evaluated_at"] if isinstance(e, dict) else e.evaluated_at),
+        reverse=True,
+    )
 
 
 @app.get(
@@ -2803,6 +2809,9 @@ def get_evaluation_by_id(
         .first()
     )
     if not evaluation:
+        mapped = candidate_result_as_evaluation(db, evaluation_id)
+        if mapped is not None:
+            return mapped
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Evaluation '{evaluation_id}' not found.",

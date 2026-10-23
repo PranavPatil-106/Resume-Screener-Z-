@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect, type FormEvent } from 'react'
+import { useState, useMemo, useEffect, type ChangeEvent, type FormEvent } from 'react'
 import { Sidebar, type AppScreen } from './Sidebar'
 import './Dashboard.css'
 import './JobDescriptions.css'
@@ -43,7 +43,7 @@ function formatDisplayDate(isoString?: string): string {
 }
 
 export function JobDescriptions({ onNavigate, onUseJd }: JobDescriptionsProps) {
-  const { isPrivileged } = useAuth()
+  const { isPrivileged, isAdmin } = useAuth()
   const [successNotice, setSuccessNotice] = useState<string | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
@@ -82,6 +82,15 @@ export function JobDescriptions({ onNavigate, onUseJd }: JobDescriptionsProps) {
   const [archiveConfirmJd, setArchiveConfirmJd] = useState<ApiJobDescription | null>(null)
   const [isArchiveSubmitting, setIsArchiveSubmitting] = useState(false)
   const [archiveError, setArchiveError] = useState<string | null>(null)
+
+  // Permanent delete (admin only). deleteSessionCount is set once the server reports linked sessions.
+  const [deleteConfirmJd, setDeleteConfirmJd] = useState<ApiJobDescription | null>(null)
+  const [deleteSessionCount, setDeleteSessionCount] = useState<number | null>(null)
+  const [isDeleteSubmitting, setIsDeleteSubmitting] = useState(false)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
+
+  // Uploading a PDF/DOCX job description into the description field
+  const [isReadingFile, setIsReadingFile] = useState(false)
 
 
   // Fetch Job Descriptions from API
@@ -321,6 +330,75 @@ export function JobDescriptions({ onNavigate, onUseJd }: JobDescriptionsProps) {
       setEditError(message)
     } finally {
       setIsEditSubmitting(false)
+    }
+  }
+
+  const closeDeleteConfirm = () => {
+    setDeleteConfirmJd(null)
+    setDeleteSessionCount(null)
+    setDeleteError(null)
+  }
+
+  const handleConfirmDelete = async () => {
+    if (!deleteConfirmJd) return
+    setIsDeleteSubmitting(true)
+    setDeleteError(null)
+    try {
+      const query = deleteSessionCount !== null ? '?delete_sessions=true' : ''
+      const res = await apiFetch(`/api/job-descriptions/${deleteConfirmJd.id}${query}`, {
+        method: 'DELETE',
+        headers: { Accept: 'application/json' },
+      })
+      if (res.status === 409) {
+        const body = await res.json().catch(() => null)
+        if (typeof body?.detail?.session_count === 'number') {
+          setDeleteSessionCount(body.detail.session_count) // ask again, now with explicit wording
+          return
+        }
+        throw new Error(typeof body?.detail === 'string' ? body.detail : 'This job description cannot be deleted right now.')
+      }
+      if (!res.ok) {
+        const body = await res.json().catch(() => null)
+        throw new Error(typeof body?.detail === 'string' ? body.detail : `Failed to delete (${res.status})`)
+      }
+      setJobDescriptions((prev) => prev.filter((item) => item.id !== deleteConfirmJd.id))
+      setSuccessNotice(`Job description "${deleteConfirmJd.title}" was permanently deleted.`)
+      closeDeleteConfirm()
+    } catch (err: unknown) {
+      setDeleteError(err instanceof Error ? err.message : 'Error deleting job description.')
+    } finally {
+      setIsDeleteSubmitting(false)
+    }
+  }
+
+  // Read a PDF/DOCX job description on the server and paste its whole text into the description field.
+  const handleJdFileUpload = async (e: ChangeEvent<HTMLInputElement>, target: 'create' | 'edit') => {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file) return
+    const setErr = target === 'create' ? setFormError : setEditError
+    setErr(null)
+    setIsReadingFile(true)
+    try {
+      const fd = new FormData()
+      fd.append('file', file)
+      const res = await apiFetch('/api/job-descriptions/parse-file', { method: 'POST', body: fd })
+      if (!res.ok) {
+        const body = await res.json().catch(() => null)
+        throw new Error(typeof body?.detail === 'string' ? body.detail : `Could not read the file (${res.status})`)
+      }
+      const parsed = await res.json()
+      if (target === 'create') {
+        setFormDescription(parsed.description)
+        if (!formTitle.trim()) setFormTitle(parsed.title)
+        if (!formSkills.trim()) setFormSkills((parsed.skills ?? []).join(', '))
+      } else {
+        setEditDescription(parsed.description)
+      }
+    } catch (err: unknown) {
+      setErr(err instanceof Error ? err.message : 'Could not read the file.')
+    } finally {
+      setIsReadingFile(false)
     }
   }
 
@@ -568,10 +646,17 @@ export function JobDescriptions({ onNavigate, onUseJd }: JobDescriptionsProps) {
                   <label htmlFor="jd-form-desc" className="form-label">
                     Role Description &amp; Responsibilities <span className="text-req">*</span>
                   </label>
+                  <div className="jd-upload-row">
+                    <label className="btn btn-secondary btn-sm">
+                      {isReadingFile ? 'Reading file…' : '⬆ Upload PDF / DOCX'}
+                      <input type="file" accept=".pdf,.docx,.doc,.txt" hidden disabled={isReadingFile} onChange={(e) => handleJdFileUpload(e, 'create')} />
+                    </label>
+                    <span className="jd-upload-hint">The extracted text is pasted into the box below.</span>
+                  </div>
                   <textarea
                     id="jd-form-desc"
                     className="form-textarea"
-                    rows={4}
+                    rows={5}
                     placeholder="Provide a concise description of responsibilities and benchmark qualification criteria..."
                     value={formDescription}
                     onChange={(e) => setFormDescription(e.target.value)}
@@ -716,10 +801,17 @@ export function JobDescriptions({ onNavigate, onUseJd }: JobDescriptionsProps) {
                   <label htmlFor="jd-edit-desc" className="form-label">
                     Role Description &amp; Responsibilities <span className="text-req">*</span>
                   </label>
+                  <div className="jd-upload-row">
+                    <label className="btn btn-secondary btn-sm">
+                      {isReadingFile ? 'Reading file…' : '⬆ Upload PDF / DOCX'}
+                      <input type="file" accept=".pdf,.docx,.doc,.txt" hidden disabled={isReadingFile} onChange={(e) => handleJdFileUpload(e, 'edit')} />
+                    </label>
+                    <span className="jd-upload-hint">Replaces the description below with the extracted text.</span>
+                  </div>
                   <textarea
                     id="jd-edit-desc"
                     className="form-textarea"
-                    rows={4}
+                    rows={5}
                     value={editDescription}
                     onChange={(e) => setEditDescription(e.target.value)}
                     required
@@ -802,6 +894,50 @@ export function JobDescriptions({ onNavigate, onUseJd }: JobDescriptionsProps) {
                     : archiveConfirmJd.is_archived
                     ? 'Restore Role'
                     : 'Archive Role'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Permanent Delete Confirmation Modal (admin only) */}
+        {isAdmin && deleteConfirmJd && (
+          <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="delete-modal-title">
+            <div className="confirm-modal-box">
+              <div className="confirm-modal-icon-danger" aria-hidden="true">
+                🗑️
+              </div>
+              <h2 id="delete-modal-title" className="confirm-modal-title">
+                Delete Job Description permanently?
+              </h2>
+              <p className="confirm-modal-desc">
+                &quot;{deleteConfirmJd.title}&quot; will be removed for good. This cannot be undone. Use Archive instead if you may need this role again.
+              </p>
+
+              {deleteSessionCount !== null && (
+                <div className="confirm-modal-warning-box">
+                  This role is used by {deleteSessionCount} screening session{deleteSessionCount === 1 ? '' : 's'}. Deleting it will also permanently delete
+                  {deleteSessionCount === 1 ? ' that session' : ' those sessions'} with their uploaded resumes, evaluations and candidate results.
+                </div>
+              )}
+
+              {deleteError && (
+                <div className="form-error-banner" role="alert">
+                  <span aria-hidden="true">⚠️</span>
+                  <span>{deleteError}</span>
+                </div>
+              )}
+
+              <div className="modal-actions-bar">
+                <button type="button" className="btn btn-secondary" onClick={closeDeleteConfirm} disabled={isDeleteSubmitting}>
+                  Cancel
+                </button>
+                <button type="button" className="btn-danger-solid" onClick={handleConfirmDelete} disabled={isDeleteSubmitting}>
+                  {isDeleteSubmitting
+                    ? 'Deleting...'
+                    : deleteSessionCount !== null
+                    ? `Delete role and ${deleteSessionCount} session${deleteSessionCount === 1 ? '' : 's'}`
+                    : 'Delete Role'}
                 </button>
               </div>
             </div>
@@ -1048,6 +1184,21 @@ export function JobDescriptions({ onNavigate, onUseJd }: JobDescriptionsProps) {
                               >
                                 {jd.is_archived ? 'Restore Role' : 'Archive'}
                               </button>
+                              {isAdmin && (
+                                <button
+                                  type="button"
+                                  className="jd-menu-item text-danger"
+                                  role="menuitem"
+                                  onClick={() => {
+                                    setActiveMenuId(null)
+                                    setDeleteConfirmJd(jd)
+                                    setDeleteSessionCount(null)
+                                    setDeleteError(null)
+                                  }}
+                                >
+                                  Delete
+                                </button>
+                              )}
                             </div>
                           )}
                         </div>
